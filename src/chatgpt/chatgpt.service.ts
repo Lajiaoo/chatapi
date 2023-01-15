@@ -88,28 +88,66 @@ export class ChatgptService {
     const email = account[Math.floor(Math.random() * account.length)].email;
     return email;
   }
+  // Send Chatgpt Message via ChatgptPoolService
   async sendChatGPTMessage(
     message: string,
     opts?: {
-      userId?: string;
+      sessionId?: string;
       tenantId: string;
     }
   ) {
     let email: string;
-    const { userId, tenantId } = opts;
-    const onetimeRequest = !userId;
-    if (onetimeRequest) {
-      email = await this.getCurrentActiveChatGPT();
-    } else {
-      const conversation =
-        await this.prismaService.chatGPTConversation.findFirst({
-          where: { userId },
-        });
-      if (!conversation) {
-        email = await this.getCurrentActiveChatGPT();
+    const { sessionId, tenantId } = opts;
+    const conversation = await this.prismaService.chatGPTConversation.findFirst(
+      {
+        where: { sessionId, tenantId },
       }
+    );
+    if (!conversation) {
+      email = await this.getCurrentActiveChatGPT();
     }
     // Send Message
+    this.logger.debug(`Send message to ${email}: ${message}`);
+    try {
+      const messageResult = await this.chatgptPoolService.sendMessage(message, {
+        email: email,
+        conversationId: conversation?.conversationId,
+        parentMessageId: conversation?.messageId,
+      });
+      if (!messageResult) {
+        this.logger.error(`Send message to ${email} failed`);
+        return {
+          conversationId: null,
+          messageId: null,
+          message: null,
+        };
+      }
+      // Save conversation info
+      await this.prismaService.chatGPTConversation.upsert({
+        where: { tenantId_sessionId: { sessionId, tenantId } },
+        create: {
+          sessionId,
+          email,
+          conversationId: messageResult.conversationId,
+          messageId: messageResult.messageId,
+          tenantId,
+        },
+        update: {
+          email,
+        },
+      });
+      return messageResult;
+    } catch (e) {
+      this.logger.error(`Send message to ${email} failed: ${e}`);
+      // Update Email status
+      this.prismaService.chatGPTAccount.update({
+        where: { email },
+        data: { status: 'Error' },
+      });
+    }
+  }
+  async sendChatGPTMessageOnetime(message: string) {
+    const email = await this.getCurrentActiveChatGPT();
     this.logger.debug(`Send message to ${email}: ${message}`);
     try {
       const messageResult = await this.chatgptPoolService.sendMessage(message, {
@@ -117,22 +155,11 @@ export class ChatgptService {
       });
       if (!messageResult) {
         this.logger.error(`Send message to ${email} failed`);
-      }
-      if (!onetimeRequest) {
-        // Save conversation info
-        await this.prismaService.chatGPTConversation.upsert({
-          where: { userId_tenantId: { userId, tenantId } },
-          create: {
-            userId,
-            email,
-            conversationId: messageResult.conversationId,
-            messageId: messageResult.messageId,
-            tenantId,
-          },
-          update: {
-            email,
-          },
-        });
+        return {
+          conversationId: null,
+          messageId: null,
+          message: null,
+        };
       }
       return messageResult;
     } catch (e) {
@@ -140,7 +167,7 @@ export class ChatgptService {
       // Update Email status
       this.prismaService.chatGPTAccount.update({
         where: { email },
-        data: { status: 'Down' },
+        data: { status: 'Error' },
       });
     }
   }
@@ -199,6 +226,21 @@ export class ChatgptService {
       });
     }
     this.logger.debug(`Found ${accounts.length} running accounts`);
+  }
+  async resetSession(sessionId: string, tenantId: string) {
+    this.logger.debug(`Reset conversation ${sessionId}`);
+    const conversation = await this.prismaService.chatGPTConversation.delete({
+      where: {
+        tenantId_sessionId: { sessionId, tenantId: 'default' },
+      },
+    });
+    if (!conversation) {
+      this.logger.error(`Conversation ${sessionId} not found`);
+      return {};
+    } else {
+      this.logger.debug(`Conversation ${sessionId} deleted`);
+      return conversation;
+    }
   }
   @Cron('1 * * * * *')
   async startAllDownAccount() {
